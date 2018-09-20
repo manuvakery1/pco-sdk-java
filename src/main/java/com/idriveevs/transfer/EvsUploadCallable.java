@@ -1,0 +1,194 @@
+/**
+ *
+ */
+package com.idriveevs.transfer;
+
+import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+
+import com.idriveevs.base.EvsAPIResource.EvsEncAlogrithm;
+import com.idriveevs.client.IdriveEvsClient;
+import com.idriveevs.exception.EvsClientException;
+import com.idriveevs.model.EvsInitiateMultipartUploadRequest;
+import com.idriveevs.model.EvsInitiateMultipartUploadResponse;
+import com.idriveevs.model.EvsListPartsRequest;
+import com.idriveevs.model.EvsListPartsResponse;
+import com.idriveevs.model.EvsUploadFileRequest;
+import com.idriveevs.model.EvsUploadFileResponse;
+import com.idriveevs.model.EvsUploadPartRequest;
+import com.idriveevs.model.EvsUploadPartResponse;
+import com.idrivevs.listener.ProgressListener;
+import com.idrivevs.listener.ProgressListnerImpl.EvsUplaodStatus;
+
+/**
+ * @author manu
+ * @version 1.0
+ * @since 1.0
+ */
+public class EvsUploadCallable implements Callable<EvsUploadPartResponse> {
+
+	private final IdriveEvsClient evsClient;
+	private final ExecutorService executorService;
+	private String uploadId;
+	private final File file;
+	private final String evsFilePath;
+	private final ProgressListener listener;
+
+	private final EvsConfigurations transferManagerSettings;
+
+	/**
+	 * @param evsClient
+	 * @param executorService
+	 * @param uploadId
+	 * @param file
+	 */
+	public EvsUploadCallable(IdriveEvsClient evsClient, ExecutorService executorService, String uploadId, File file,
+			EvsConfigurations transferManagerSettings, String evsFilePath, ProgressListener listener) {
+		super();
+		this.evsClient = evsClient;
+		this.executorService = executorService;
+		this.uploadId = uploadId;
+		this.file = file;
+		this.transferManagerSettings = transferManagerSettings;
+		this.evsFilePath = evsFilePath;
+		this.listener = listener;
+	}
+
+	private final List<Future<EvsUploadPartResponse>> futures = new ArrayList<Future<EvsUploadPartResponse>>();
+
+	
+	private boolean canUploadInSingleChunk(){
+		long singleUploadThrottle = transferManagerSettings.getSingleUploadThrottle();
+		return this.file.length() < singleUploadThrottle;
+	}
+	
+	
+	/*
+	 * (non-Javadoc)
+	 * 
+	 * @see java.util.concurrent.Callable#call()
+	 */
+	public EvsUploadPartResponse call() throws Exception {
+		if(canUploadInSingleChunk()){
+			uploadFullChunk();
+		}else{
+			uploadParts();
+		}
+		return null;
+	}
+
+	public void uploadParts() {
+		if (null == uploadId) {
+			uploadId = initiateMultipartRequest();
+		}
+		UploadPartRequestIterator uploadPartRequestFactory = new UploadPartRequestIterator(uploadId,
+				transferManagerSettings.getOptimalPartSize(), file, listener);
+		List<Integer> existingPartsForResume = identifyExistingPartsForResume(uploadId);
+		while (uploadPartRequestFactory.hasNext()) {
+			if (executorService.isShutdown()) {
+				listener.updateUploadStatus(EvsUplaodStatus.Cancelled);
+				throw new EvsClientException("thread pool has alreday stoped");
+			}
+			final EvsUploadPartRequest evsUploadPartRequest = (EvsUploadPartRequest) uploadPartRequestFactory.next();
+			if (existingPartsForResume.contains(evsUploadPartRequest.getPartNo())) {
+				System.out.println("skipping uploaded chunk with part no" + evsUploadPartRequest.getPartNo());
+				listener.updateTransferredBytes(transferManagerSettings.getOptimalPartSize());
+				continue;
+			}
+			Future<EvsUploadPartResponse> job = executorService.submit(new Callable<EvsUploadPartResponse>() {
+				/*
+				 * (non-Javadoc)
+				 * 
+				 * @see java.util.concurrent.Callable#call()
+				 */
+				public EvsUploadPartResponse call() throws Exception {
+					try {
+						return evsClient.uploadFilePart(evsUploadPartRequest, "test123456", EvsEncAlogrithm.AES);
+					} catch (Exception e) {
+						e.printStackTrace();
+						cancelFutures();
+						listener.updateUploadStatus(EvsUplaodStatus.Cancelled);
+						throw new EvsClientException(e.getMessage(), e);
+					}
+				}
+			});
+			futures.add(job);
+		}
+
+	}
+
+	public EvsUploadFileResponse uploadFullChunk() {
+		EvsUploadFileRequest evsUploadFileRequest = new EvsUploadFileRequest();
+		evsUploadFileRequest.setFile(file);
+		evsUploadFileRequest.setFileName(file.getName());
+		evsUploadFileRequest.setFileSize(file.length());
+		evsUploadFileRequest.setFileEvsPath(evsFilePath);
+		return evsClient.uploadFile(evsUploadFileRequest);
+	}
+
+	/**
+	 * 
+	 */
+	public synchronized void cancelFutures() {
+		for (Future<EvsUploadPartResponse> future : futures) {
+			future.cancel(true);
+		}
+		futures.clear();
+
+	}
+
+	/**
+	 * @return
+	 */
+	private String initiateMultipartRequest() {
+		EvsInitiateMultipartUploadRequest initiateRequest = new EvsInitiateMultipartUploadRequest();
+		initiateRequest.setFileEvsPath(evsFilePath);
+		initiateRequest.setFileName(file.getName());
+		initiateRequest.setFileSize(file.length());
+		initiateRequest.setEncryptionEnabled(true);
+		initiateRequest.setEncAlgorithm(EvsEncAlogrithm.AES);
+		initiateRequest.setEncKey("test123456");
+		EvsInitiateMultipartUploadResponse initiateMultipartFileUpload = evsClient
+				.initiateMultipartFileUpload(initiateRequest);
+		return initiateMultipartFileUpload.getUploadId();
+	}
+
+	/**
+	 * 
+	 * @param uploadId
+	 * @return
+	 */
+	private List<Integer> identifyExistingPartsForResume(String uploadId) {
+		List<Integer> partNumbers = new ArrayList<Integer>();
+		if (uploadId == null) {
+			return partNumbers;
+		}
+		EvsListPartsRequest listPartsRequest = new EvsListPartsRequest();
+		listPartsRequest.setUploadId(uploadId);
+		EvsListPartsResponse listParts = evsClient.listParts(listPartsRequest);
+		if (null != listParts) {
+			List<EvsUploadPartResponse> fileParts = listParts.getFileParts();
+			for (EvsUploadPartResponse evsUploadPartResponse : fileParts) {
+				partNumbers.add(evsUploadPartResponse.getPartId());
+			}
+		}
+		return partNumbers;
+	}
+
+	public List<Future<EvsUploadPartResponse>> getFutures() {
+		return this.futures;
+	}
+
+	public String getUploadId() {
+		return this.uploadId;
+	}
+
+	public ProgressListener getProgressListner() {
+		return this.listener;
+	}
+
+}
